@@ -1,0 +1,200 @@
+-- file: lua/backend-baidu.lua
+-- 终极修复：针对红果短剧独立验证机制
+
+-- ==================== 1. 模块与库函数加载 ====================
+-- 引入底层 C/C++ 框架封装的 http 模块
+local http = require 'http'
+-- 引入代理软件核心后端模块 backend（包含连接信息获取、数据读写等 API）
+local backend = require 'backend'
+
+-- 将常用字符串处理函数缓存为局部变量，用于提升 Lua 运行时的函数调用效率
+local char = string.char    -- 将 ASCII 码转换为字符
+local byte = string.byte    -- 将字符转换为 ASCII 码
+local find = string.find    -- 字符串查找函数
+local sub = string.sub      -- 字符串截取函数
+local gsub = string.gsub    -- 字符串替换函数
+local lower = string.lower  -- 字符串转小写函数
+
+-- 引用 backend 模块中预定义的常量
+local ADDRESS = backend.ADDRESS
+local PROXY = backend.PROXY
+local DIRECT_WRITE = backend.SUPPORT.DIRECT_WRITE -- 标记支持直写（握手完成后直接透传数据）
+
+-- 引用底层处理结果的返回值常量
+local SUCCESS = backend.RESULT.SUCCESS       -- 操作成功标志
+local HANDSHAKE = backend.RESULT.HANDSHAKE   -- 处于握手阶段标志
+local DIRECT = backend.RESULT.DIRECT         -- 进入直接透传/转发阶段标志
+
+-- 绑定底层 C 语言层面的 Ctx（上下文对象）获取函数到局部变量
+local ctx_uuid = backend.get_uuid             -- 获取当前 TCP 会话的唯一标识符 UUID
+local ctx_proxy_type = backend.get_proxy_type -- 获取代理类型
+local ctx_address_type = backend.get_address_type -- 获取目标地址类型（IPv4/IPv6/域名）
+local ctx_address_host = backend.get_address_host -- 获取目标主机的域名或 IP 字符串
+local ctx_address_bytes = backend.get_address_bytes-- 获取目标的原始字节流地址
+local ctx_address_port = backend.get_address_port -- 获取目标端口号
+local ctx_write = backend.write               -- 向代理服务器发送数据包
+local ctx_free = backend.free                 -- 释放连接上下文绑定的内存资源
+local ctx_debug = backend.debug               -- 输出调试日志到系统控制台
+
+-- ==================== 2. 全局状态机与白名单定义 ====================
+-- 定义一个哈希表（Table），用于记录每个连接（以 uuid 为 Key）的 HTTP 握手状态
+local flags = {}
+local kHttpHeaderSent = 1    -- 标志位：已发送伪装 HTTP 请求头
+local kHttpHeaderRecived = 2 -- 标志位：已收到代理服务器的 HTTP 响应头
+
+-- 定义红果短剧及字节跳动系视频/广告/CDN 域名的特征关键字列表
+local HK_DOMAINS = {
+    "zijie", "hongguo", "novel", "pangolin", "sigmob",
+    "amemv", "douyin", "iesdouyin", "byteimg",
+    "toutiao", "ixigua", "snssdk", "bdurl",
+}
+
+---
+-- 函数：判断当前访问的目标域名是否属于红果/字节系
+-- @param host string 目标主机名
+-- @return boolean 是否包含关键字
+---
+function is_hongguo_target(host)
+    -- 将域名统一转换为小写，防止因为大小写混淆漏掉匹配
+    local h = lower(host)
+    -- 遍历白名单列表
+    for _, v in ipairs(HK_DOMAINS) do
+        -- find 参数：h=源串, v=目标子串, 1=起始索引, true=关闭正则使用纯文本查找
+        if find(h, v, 1, true) then
+            return true -- 只要找到任意一个关键字，立即返回 true
+        end
+    end
+    return false -- 没有匹配到任何关键字，返回 false
+end
+
+-- ==================== 3. 代理底层回调函数实现 ====================
+
+---
+-- 回调 1：获取连接标志回调
+-- 告知底层框架当前连接的特性
+---
+function wa_lua_on_flags_cb(ctx)
+    -- 返回 DIRECT_WRITE，允许底层在握手完毕后绕过上层逻辑，进行高效率的数据直写
+    return DIRECT_WRITE
+end
+
+---
+-- 回调 2：握手控制回调
+-- 负责构造并向代理服务器发送 HTTP CONNECT 伪装报文
+---
+function wa_lua_on_handshake_cb(ctx)
+    -- 获取当前会话的唯一 UUID 标识
+    local uuid = ctx_uuid(ctx)
+
+    -- 如果当前连接的状态已经是“已收到握手响应”，说明协议已完成，返回 true 结束握手流程
+    if flags[uuid] == kHttpHeaderRecived then
+        return true
+    end
+
+    -- 如果尚未发送 HTTP CONNECT 请求头
+    if flags[uuid] ~= kHttpHeaderSent then
+        -- 获取客户端真正想要访问的目标主机和端口
+        local host = ctx_address_host(ctx)
+        local port = ctx_address_port(ctx)
+        
+        -- 判断目标主机是否命中红果/字节系域名
+        local is_hg = is_hongguo_target(host)
+        
+        -- 打印连接调试日志，输出目标地址及命中判定结果
+        ctx_debug("CONNECT to " .. host .. ":" .. port .. " hg=" .. tostring(is_hg))
+
+        -- 关键：红果视频流量需要更完整的百度伪装
+        -- 模拟百度网盘 PC 客户端的 CONNECT 行为
+        local res
+        if is_hg then
+            -- 红果目标：追加更多百度内部鉴权及追踪特征头（X-Bd-Traceid, X-Bd-Product, X-Bd-Uid 等）
+            res = 'CONNECT ' .. host .. ':' .. port .. ' HTTP/1.1\r\n' ..
+                  'Host: 153.3.236.22:443\r\n' ..
+                  'Proxy-Connection: Keep-Alive\r\n' ..
+                  'Connection: keep-alive\r\n' ..
+                  'X-T5-Auth: 683556433\r\n' ..
+                  'User-Agent: baiduboxapp\r\n' ..
+                  'X-Bd-Traceid: 0000000000000000000000000000000000000000\r\n' ..
+                  'X-Bd-Product: BDUSS\r\n' ..
+                  'X-Bd-Uid: 0\r\n' ..
+                  'Accept: */*\r\n' ..
+                  '\r\n' -- HTTP 协议头以两个连续的 \r\n 结尾
+        else
+            -- 非红果普通流量：使用标准的百度 App (baiduboxapp) 免流请求头
+            res = 'CONNECT ' .. host .. ':' .. port .. ' HTTP/1.1\r\n' ..
+                  'Host: 153.3.236.22:443\r\n' ..
+                  'Proxy-Connection: Keep-Alive\r\n' ..
+                  'Connection: keep-alive\r\n' ..
+                  'X-T5-Auth: 683556433\r\n' ..
+                  'User-Agent: baiduboxapp\r\n' ..
+                  '\r\n' -- HTTP 协议头以两个连续的 \r\n 结尾
+        end
+        
+        -- 调用底层接口将拼接好的伪装请求数据写入网络连接
+        ctx_write(ctx, res)
+        -- 更新该连接状态为“已发送 HTTP 请求头”
+        flags[uuid] = kHttpHeaderSent
+    end
+
+    -- 返回 false 告诉底层框架握手尚未完成，等待下一轮响应
+    return false
+end
+
+---
+-- 回调 3：数据读取回调
+-- 处理从代理服务器接收到的数据
+---
+function wa_lua_on_read_cb(ctx, buf)
+    local uuid = ctx_uuid(ctx)
+    
+    -- 状态 1：若处于已发送请求头阶段，当前收到的 buf 就是代理服务器返回的 CONNECT 响应
+    if flags[uuid] == kHttpHeaderSent then
+        -- 更新该连接状态为“已收到握手响应”
+        flags[uuid] = kHttpHeaderRecived
+        -- 返回 HANDSHAKE 和 nil（不转发响应头给客户端 App），完成握手状态转换
+        return HANDSHAKE, nil
+    end
+    
+    -- 状态 2：如果传入的数据块为空，直接切入透传模式
+    if buf == nil then
+        return DIRECT, nil
+    end
+    
+    -- 状态 3：如果数据块长度为 0，返回空字符串
+    if #buf == 0 then
+        return DIRECT, ''
+    end
+    
+    -- 安全告警检查：检查在正常透传阶段是否误收到明文 HTTP 响应
+    -- (通常加密的 TLS 流量开头不会是 "HTTP/"，收到了说明代理网关在干扰或劫持明文)
+    if #buf < 2000 and find(buf, "HTTP/", 1, true) == 1 then
+        -- 收到明文 HTTP 响应，说明 TLS 被中间人截断或防火墙抛出了错误页面
+        ctx_debug("ALERT: plaintext HTTP in stream!")
+    end
+    
+    -- 握手完成后，后续下行数据均直接返回 DIRECT 模式透传给客户端
+    return DIRECT, buf
+end
+
+---
+-- 回调 4：数据写入回调
+-- 客户端数据上行发送时触发
+---
+function wa_lua_on_write_cb(ctx, buf)
+    -- 握手成功后的所有客户端上行数据，直接原样透传发送
+    return DIRECT, buf
+end
+
+---
+-- 回调 5：连接关闭回调
+-- 当 TCP 会话断开或被销毁时由底层触发
+---
+function wa_lua_on_close_cb(ctx)
+    local uuid = ctx_uuid(ctx)
+    -- 清除该连接在全局标志数组中的记录，防止内存泄漏
+    flags[uuid] = nil
+    -- 释放该连接在 C 层面的上下文资源
+    ctx_free(ctx)
+    -- 返回成功状态
+    return SUCCESS
+end
