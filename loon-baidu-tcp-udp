@@ -1,0 +1,142 @@
+/**
+ * 本脚本实现面向 Loon custom 协议的百度系/字节系免流与 UDP 伪装逻辑
+ * 说明：将 Lua 配置转换为 Loon 可用的 JS 脚本
+ */
+
+let HTTP_STATUS_INVALID = -1
+let HTTP_STATUS_CONNECTED = 0
+let HTTP_STATUS_WAITRESPONSE = 1
+let HTTP_STATUS_FORWARDING = 2
+var httpStatus = HTTP_STATUS_INVALID
+
+// 字节系/红果短剧域名特征
+const HK_DOMAINS = [
+    "zijie", "hongguo", "novel", "pangolin", "sigmob",
+    "amemv", "douyin", "iesdouyin", "byteimg",
+    "toutiao", "ixigua", "snssdk", "bdurl"
+]
+
+// UDP / 游戏伪装域名特征
+const UDP_TARGETS = ["udp", "quic", "game", "minecraft", "dota", "lol", "valorant", "genshin"]
+
+/**
+ * 判断是否为红果短剧/字节系目标
+ */
+function isHongguoTarget(host) {
+    if (!host) return false
+    const h = host.toLowerCase()
+    return HK_DOMAINS.some(v => h.includes(v))
+}
+
+/**
+ * 判断是否需要进行 UDP 伪装 (对应原 Lua 逻辑，默认全部 UDP 或匹配关键词)
+ */
+function isUdpMasqueradeTarget(host, isUdp) {
+    if (!isUdp) return false
+    if (!host) return true
+    const h = host.toLowerCase()
+    if (UDP_TARGETS.some(v => h.includes(v))) {
+        return true
+    }
+    return true // 默认全部 UDP 流量都进行伪装
+}
+
+function tunnelDidConnected() {
+    if ($session.proxy.isTLS) {
+        // TLS 连接握手
+    } else {
+        _writeHttpHeader()
+        httpStatus = HTTP_STATUS_CONNECTED
+    }
+    return true
+}
+
+function tunnelTLSFinished() {
+    _writeHttpHeader()
+    httpStatus = HTTP_STATUS_CONNECTED
+    return true
+}
+
+function tunnelDidRead(data) {
+    if (httpStatus === HTTP_STATUS_WAITRESPONSE) {
+        // 握手响应完成，进入数据转发模式
+        console.log(`[Baidu-Fake] HTTP 握手成功: ${$session.conHost}:${$session.conPort}`)
+        httpStatus = HTTP_STATUS_FORWARDING
+        $tunnel.established($session)
+        return null // 拦截代理返回的 200 OK 响应报文，不传给客户端
+    } else if (httpStatus === HTTP_STATUS_FORWARDING) {
+        return data
+    }
+}
+
+function tunnelDidWrite() {
+    if (httpStatus === HTTP_STATUS_CONNECTED) {
+        httpStatus = HTTP_STATUS_WAITRESPONSE
+        // 读取代理服务器响应直到 \r\n\r\n 结尾
+        $tunnel.readTo($session, "\x0D\x0A\x0D\x0A")
+        return false // 中断 write 回调，等待响应数据
+    }
+    return true
+}
+
+function tunnelDidClose() {
+    httpStatus = HTTP_STATUS_INVALID
+    return true
+}
+
+/**
+ * 构造免流伪装请求头
+ */
+function _writeHttpHeader() {
+    const host = $session.conHost
+    const port = $session.conPort
+    // Loon 协议中，type === 1 通常表示 UDP 会话（也有部分版本使用 $session.isUdp 属性）
+    const isUdp = $session.type === 1 || $session.isUdp === true
+
+    const isHg = isHongguoTarget(host)
+    const doUdpMask = isUdpMasqueradeTarget(host, isUdp)
+
+    console.log(`[Baidu-Fake] CONNECT -> ${host}:${port} | isHg: ${isHg} | isUdp: ${isUdp} | UDP-Mask: ${doUdpMask}`)
+
+    let header = ""
+
+    if (doUdpMask) {
+        // ==================== UDP 免流量伪装 ====================
+        header = `CONNECT ${host}:${port} HTTP/1.1\r\n` +
+                 `Host: 153.3.236.22:443\r\n` +
+                 `Proxy-Connection: Keep-Alive\r\n` +
+                 `Connection: keep-alive\r\n` +
+                 `X-T5-Auth: 683556433\r\n` +
+                 `User-Agent: baiduboxapp/8.0.0.0 (Linux; Android)\r\n` +
+                 `X-Bd-Traceid: 0000000000000000000000000000000000000000\r\n` +
+                 `X-Bd-Product: BDUSS\r\n` +
+                 `X-Bd-Uid: 0\r\n` +
+                 `X-Bd-Client-Type: UDP-TRANS\r\n` +
+                 `X-Bd-Trans-Type: masquerade\r\n` +
+                 `X-Bd-Request-Mode: tunnel\r\n` +
+                 `Accept: */*\r\n` +
+                 `Content-Length: 0\r\n\r\n`
+    } else if (isHg) {
+        // ==================== 红果/字节 TCP 加强版伪装 ====================
+        header = `CONNECT ${host}:${port} HTTP/1.1\r\n` +
+                 `Host: 153.3.236.22:443\r\n` +
+                 `Proxy-Connection: Keep-Alive\r\n` +
+                 `Connection: keep-alive\r\n` +
+                 `X-T5-Auth: 683556433\r\n` +
+                 `User-Agent: baiduboxapp\r\n` +
+                 `X-Bd-Traceid: 0000000000000000000000000000000000000000\r\n` +
+                 `X-Bd-Product: BDUSS\r\n` +
+                 `X-Bd-Uid: 0\r\n` +
+                 `Accept: */*\r\n\r\n`
+    } else {
+        // ==================== 普通 TCP 伪装 ====================
+        header = `CONNECT ${host}:${port} HTTP/1.1\r\n` +
+                 `Host: 153.3.236.22:443\r\n` +
+                 `Proxy-Connection: Keep-Alive\r\n` +
+                 `Connection: keep-alive\r\n` +
+                 `X-T5-Auth: 683556433\r\n` +
+                 `User-Agent: baiduboxapp\r\n\r\n`
+    }
+
+    $tunnel.write($session, header)
+}
