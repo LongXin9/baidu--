@@ -3,6 +3,8 @@
 百度-终极修复
 仅供妖友使用
 
+
+##订阅链接
 **Shadowrocket-baidu-weizhuang：**
 https://raw.githubusercontent.com/LongXin9/baidu--/refs/heads/main/Shadowrocket-baidu-weizhuang
 
