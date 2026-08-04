@@ -1,0 +1,179 @@
+/**
+ * 高级免流混淆脚本 (Loon Custom 协议)
+ * 增加：抗去匿名化混淆、动态 UA/TraceID、HTTP 代理连接保活
+ */
+
+let HTTP_STATUS_INVALID = -1
+let HTTP_STATUS_CONNECTED = 0
+let HTTP_STATUS_WAITRESPONSE = 1
+let HTTP_STATUS_FORWARDING = 2
+var httpStatus = HTTP_STATUS_INVALID
+
+// 域名特征列表
+const HK_DOMAINS = [
+    "zijie", "hongguo", "novel", "pangolin", "sigmob",
+    "amemv", "douyin", "iesdouyin", "byteimg",
+    "toutiao", "ixigua", "snssdk", "bdurl"
+]
+const UDP_TARGETS = ["udp", "quic", "game", "minecraft", "dota", "lol", "valorant", "genshin"]
+
+// 动态 UA 生成池
+const BAIDU_UA_VERSIONS = [
+    "baiduboxapp/13.25.0.10 (Linux; U; Android 13; zh_CN; M2012K11C)",
+    "baiduboxapp/13.30.5.11 (Linux; U; Android 14; zh_CN; 2304FPN6DC)",
+    "baiduboxapp/14.2.0.10 (iPhone; CPU iPhone OS 16_6 like Mac OS X) Mobile/15E148",
+    "baiduboxapp/14.5.1.12 (iPhone; CPU iPhone OS 17_2 like Mac OS X) Mobile/15E148",
+    "baiduboxapp/13.18.0.10 (Linux; U; Android 12; zh_CN; SM-G9980)"
+]
+
+// ==================== 实用辅助工具函数 ====================
+
+/**
+ * 生成 32 位十六进制动态 TraceID (抗 DPI 模式匹配)
+ */
+function generateDynamicTraceId() {
+    const chars = '0123456789abcdef'
+    let traceId = ''
+    for (let i = 0; i < 32; i++) {
+        traceId += chars.charAt(Math.floor(Math.random() * chars.length))
+    }
+    return traceId
+}
+
+/**
+ * 获取随机数/字符串
+ */
+function getRandomInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min
+}
+
+function getRandomUA() {
+    return BAIDU_UA_VERSIONS[Math.floor(Math.random() * BAIDU_UA_VERSIONS.length)]
+}
+
+/**
+ * 混淆请求头字段顺序（破坏标准 DPI 的正则指纹提取）
+ */
+function shuffleHeaders(headerArray) {
+    for (let i = headerArray.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [headerArray[i], headerArray[j]] = [headerArray[j], headerArray[i]];
+    }
+    return headerArray
+}
+
+function isHongguoTarget(host) {
+    if (!host) return false
+    const h = host.toLowerCase()
+    return HK_DOMAINS.some(v => h.includes(v))
+}
+
+function isUdpMasqueradeTarget(host, isUdp) {
+    if (!isUdp) return false
+    if (!host) return true
+    const h = host.toLowerCase()
+    return UDP_TARGETS.some(v => h.includes(v)) || true
+}
+
+// ==================== Loon 生命周期回调 ====================
+
+function tunnelDidConnected() {
+    if ($session.proxy.isTLS) {
+        // TLS 连接
+    } else {
+        _writeHttpHeader()
+        httpStatus = HTTP_STATUS_CONNECTED
+    }
+    return true
+}
+
+function tunnelTLSFinished() {
+    _writeHttpHeader()
+    httpStatus = HTTP_STATUS_CONNECTED
+    return true
+}
+
+function tunnelDidRead(data) {
+    if (httpStatus === HTTP_STATUS_WAITRESPONSE) {
+        console.log(`[Baidu-AntiDeAnon] 代理握手成功: ${$session.conHost}:${$session.conPort}`)
+        httpStatus = HTTP_STATUS_FORWARDING
+        $tunnel.established($session)
+        return null // 截断代理层 CONNECT 200 回包，透传后续数据
+    } else if (httpStatus === HTTP_STATUS_FORWARDING) {
+        return data
+    }
+}
+
+function tunnelDidWrite() {
+    if (httpStatus === HTTP_STATUS_CONNECTED) {
+        httpStatus = HTTP_STATUS_WAITRESPONSE
+        $tunnel.readTo($session, "\x0D\x0A\x0D\x0A") // 读取至 HTTP 报头结束符
+        return false
+    }
+    return true
+}
+
+function tunnelDidClose() {
+    httpStatus = HTTP_STATUS_INVALID
+    return true
+}
+
+// ==================== 核心：伪装头构造与动态混淆 ====================
+
+function _writeHttpHeader() {
+    const host = $session.conHost
+    const port = $session.conPort
+    const isUdp = $session.type === 1 || $session.isUdp === true
+
+    const isHg = isHongguoTarget(host)
+    const doUdpMask = isUdpMasqueradeTarget(host, isUdp)
+
+    // 1. 动态变量生成
+    const dynamicTraceId = generateDynamicTraceId()
+    const dynamicUA = getRandomUA()
+    const dynamicUid = getRandomInt(10000000, 99999999).toString()
+    const randomNonce = getRandomInt(1000, 9999)
+
+    // 2. 基础请求首行
+    const requestLine = `CONNECT ${host}:${port} HTTP/1.1\r\n`
+
+    // 3. 构建可乱序混淆的请求头集合
+    let headersMap = [
+        `Host: 153.3.236.22:443`,
+        `Proxy-Connection: Keep-Alive`,
+        `Connection: keep-alive`,
+        `X-T5-Auth: 683556433`,
+        `User-Agent: ${dynamicUA}`,
+        `X-Bd-Traceid: ${dynamicTraceId}`,
+        `X-Bd-Product: BDUSS`,
+        `X-Bd-Uid: ${dynamicUid}`,
+        `Accept: */*`
+    ]
+
+    // 针对 UDP / 字节系特定场景加入特征与抗指纹扰动项
+    if (doUdpMask) {
+        headersMap.push(`X-Bd-Client-Type: UDP-TRANS`)
+        headersMap.push(`X-Bd-Trans-Type: masquerade`)
+        headersMap.push(`X-Bd-Request-Mode: tunnel`)
+        headersMap.push(`Content-Length: 0`)
+        headersMap.push(`X-Bd-Nonce: ${randomNonce}`) // 抗重放与去匿名化扰动字段
+    } else if (isHg) {
+        headersMap.push(`X-Bd-Feature: hongguo-v2`)
+        headersMap.push(`X-Bd-Client-Type: TCP-STRENGTH`)
+        headersMap.push(`X-Bd-Nonce: ${randomNonce}`)
+    } else {
+        headersMap.push(`X-Bd-Nonce: ${randomNonce}`)
+    }
+
+    // 4. 打乱部分非关键 Header 顺序（保持第一个 Host 为基准，防止极少数严格网关解析报错）
+    const hostHeader = headersMap.shift() // 提取 Host
+    headersMap = shuffleHeaders(headersMap) // 打乱其余 Header
+    headersMap.unshift(hostHeader) // 放回 Host
+
+    // 5. 组合最终请求报文
+    const finalHeader = requestLine + headersMap.join("\r\n") + "\r\n\r\n"
+
+    console.log(`[Baidu-AntiDeAnon] 发送伪装头 | TraceID: ${dynamicTraceId.substring(0, 8)}... | Mode: ${doUdpMask ? 'UDP-Mask' : (isHg ? 'HG-TCP' : 'Standard')}`)
+
+    $tunnel.write($session, finalHeader)
+}
