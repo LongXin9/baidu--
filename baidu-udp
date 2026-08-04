@@ -1,0 +1,180 @@
+-- file: lua/backend-baidu.lua
+-- 终极修复：针对红果短剧独立验证机制 + UDP免流量伪装
+
+local http = require 'http'
+local backend = require 'backend'
+
+local char = string.char
+local byte = string.byte
+local find = string.find
+local sub = string.sub
+local gsub = string.gsub
+local lower = string.lower
+
+local ADDRESS = backend.ADDRESS
+local PROXY = backend.PROXY
+local DIRECT_WRITE = backend.SUPPORT.DIRECT_WRITE
+
+local SUCCESS = backend.RESULT.SUCCESS
+local HANDSHAKE = backend.RESULT.HANDSHAKE
+local DIRECT = backend.RESULT.DIRECT
+
+local ctx_uuid = backend.get_uuid
+local ctx_proxy_type = backend.get_proxy_type
+local ctx_address_type = backend.get_address_type
+local ctx_address_host = backend.get_address_host
+local ctx_address_bytes = backend.get_address_bytes
+local ctx_address_port = backend.get_address_port
+local ctx_write = backend.write
+local ctx_free = backend.free
+local ctx_debug = backend.debug
+
+-- 新增：UDP相关
+local ctx_is_udp = backend.get_is_udp or function() return false end  -- 兼容旧版
+
+local flags = {}
+local kHttpHeaderSent = 1
+local kHttpHeaderRecived = 2
+
+-- 红果/字节系视频域名特征
+local HK_DOMAINS = {
+    "zijie", "hongguo", "novel", "pangolin", "sigmob",
+    "amemv", "douyin", "iesdouyin", "byteimg",
+    "toutiao", "ixigua", "snssdk", "bdurl",
+}
+
+function is_hongguo_target(host)
+    local h = lower(host)
+    for _, v in ipairs(HK_DOMAINS) do
+        if find(h, v, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+-- 判断是否需要UDP免流伪装（可自行扩展域名/IP）
+function is_udp_masquerade_target(host)
+    if not host then return true end
+    local h = lower(host)
+    -- 常见游戏/UDP高频域名，可继续添加
+    local udp_targets = {"udp", "quic", "game", "minecraft", "dota", "lol", "valorant", "genshin"}
+    for _, v in ipairs(udp_targets) do
+        if find(h, v, 1, true) then
+            return true
+        end
+    end
+    return true  -- 默认全部UDP都做伪装
+end
+
+function wa_lua_on_flags_cb(ctx)
+    return DIRECT_WRITE
+end
+
+function wa_lua_on_handshake_cb(ctx)
+    local uuid = ctx_uuid(ctx)
+    local is_udp = ctx_is_udp(ctx)
+
+    if flags[uuid] == kHttpHeaderRecived then
+        return true
+    end
+
+    if flags[uuid] ~= kHttpHeaderSent then
+        local host = ctx_address_host(ctx)
+        local port = ctx_address_port(ctx)
+        local addr_type = ctx_address_type(ctx)
+        
+        local is_hg = is_hongguo_target(host)
+        local do_udp_mask = is_udp and is_udp_masquerade_target(host)
+        
+        ctx_debug("CONNECT to " .. host .. ":" .. port .. 
+                 " hg=" .. tostring(is_hg) .. 
+                 " udp=" .. tostring(is_udp) .. 
+                 " mask=" .. tostring(do_udp_mask))
+
+        local res
+
+        if do_udp_mask then
+            -- ==================== UDP免流量伪装核心 ====================
+            -- 模拟百度网盘/百度系内部UDP转发特征（更难被识别）
+            res = 'CONNECT ' .. host .. ':' .. port .. ' HTTP/1.1\r\n' ..
+                  'Host: 153.3.236.22:443\r\n' ..
+                  'Proxy-Connection: Keep-Alive\r\n' ..
+                  'Connection: keep-alive\r\n' ..
+                  'X-T5-Auth: 683556433\r\n' ..
+                  'User-Agent: baiduboxapp/8.0.0.0 (Linux; Android)\r\n' ..
+                  'X-Bd-Traceid: 0000000000000000000000000000000000000000\r\n' ..
+                  'X-Bd-Product: BDUSS\r\n' ..
+                  'X-Bd-Uid: 0\r\n' ..
+                  'X-Bd-Client-Type: UDP-TRANS\r\n' ..           -- UDP特征标识
+                  'X-Bd-Trans-Type: masquerade\r\n' ..            -- 伪装标识
+                  'X-Bd-Request-Mode: tunnel\r\n' ..
+                  'Accept: */*\r\n' ..
+                  'Content-Length: 0\r\n' ..
+                  '\r\n'
+        elseif is_hg then
+            -- 红果目标：TCP加强版伪装
+            res = 'CONNECT ' .. host .. ':' .. port .. ' HTTP/1.1\r\n' ..
+                  'Host: 153.3.236.22:443\r\n' ..
+                  'Proxy-Connection: Keep-Alive\r\n' ..
+                  'Connection: keep-alive\r\n' ..
+                  'X-T5-Auth: 683556433\r\n' ..
+                  'User-Agent: baiduboxapp\r\n' ..
+                  'X-Bd-Traceid: 0000000000000000000000000000000000000000\r\n' ..
+                  'X-Bd-Product: BDUSS\r\n' ..
+                  'X-Bd-Uid: 0\r\n' ..
+                  'Accept: */*\r\n' ..
+                  '\r\n'
+        else
+            -- 普通TCP
+            res = 'CONNECT ' .. host .. ':' .. port .. ' HTTP/1.1\r\n' ..
+                  'Host: 153.3.236.22:443\r\n' ..
+                  'Proxy-Connection: Keep-Alive\r\n' ..
+                  'Connection: keep-alive\r\n' ..
+                  'X-T5-Auth: 683556433\r\n' ..
+                  'User-Agent: baiduboxapp\r\n' ..
+                  '\r\n'
+        end
+        
+        ctx_write(ctx, res)
+        flags[uuid] = kHttpHeaderSent
+    end
+
+    return false
+end
+
+function wa_lua_on_read_cb(ctx, buf)
+    local uuid = ctx_uuid(ctx)
+    
+    if flags[uuid] == kHttpHeaderSent then
+        flags[uuid] = kHttpHeaderRecived
+        return HANDSHAKE, nil
+    end
+    
+    if buf == nil then
+        return DIRECT, nil
+    end
+    
+    if #buf == 0 then
+        return DIRECT, ''
+    end
+
+    -- UDP伪装模式下，过滤可能的探测包
+    local is_udp = ctx_is_udp(ctx)
+    if is_udp and #buf < 2000 and find(buf, "HTTP/", 1, true) == 1 then
+        ctx_debug("UDP masquerade: received HTTP response")
+    end
+    
+    return DIRECT, buf
+end
+
+function wa_lua_on_write_cb(ctx, buf)
+    return DIRECT, buf
+end
+
+function wa_lua_on_close_cb(ctx)
+    local uuid = ctx_uuid(ctx)
+    flags[uuid] = nil
+    ctx_free(ctx)
+    return SUCCESS
+end
