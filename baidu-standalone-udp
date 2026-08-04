@@ -1,0 +1,347 @@
+-- ==============================================================================
+-- 文件名: lua/backend-baidu-standalone-udp.lua
+-- 功能: 百度免流 + UDP强伪装 + 智能域名判定 + 动态UA/TraceID + 抗去匿名化指纹混淆 + 心跳保活
+-- 说明: 配置文件每一行均带有详细注释，方便初学者阅读、学习与后续维护。
+-- 架构: 本配置完全基于纯客户端运行，无需外部专用 VPS 服务器接应。
+-- ==============================================================================
+
+-- ==================== 1. 基础模块引入与安全加载 ====================
+-- 加载代理底层 C/C++ 封装的 HTTP 交互模块
+local http = require 'http'
+-- 加载代理底层 Backend 核心交互模块
+local backend = require 'backend'
+
+-- 缓存 Lua 原生字符串与数学函数到局部变量，提升密集网络回调时的执行效率
+local char = string.char      -- ASCII 码转字符函数
+local byte = string.byte      -- 字符转 ASCII 码函数
+local find = string.find      -- 字符串查找函数
+local sub = string.sub        -- 字符串截取函数
+local gsub = string.gsub      -- 字符串正则替换函数
+local lower = string.lower    -- 字符串转小写函数
+local random = math.random    -- 随机数生成函数
+local time = os.time          -- 系统时间戳获取函数
+
+-- 引用 Backend 预定义网络类型常量
+local ADDRESS = backend.ADDRESS                         -- 地址类型标识
+local PROXY = backend.PROXY                             -- 代理类型标识
+local DIRECT_WRITE = backend.SUPPORT.DIRECT_WRITE       -- 是否支持直写标志
+
+-- 引用 Backend 连接握手状态常量
+local SUCCESS = backend.RESULT.SUCCESS                   -- 操作成功返回码
+local HANDSHAKE = backend.RESULT.HANDSHAKE               -- 握手阶段返回码
+local DIRECT = backend.RESULT.DIRECT                     -- 直连/透传阶段返回码
+
+-- 绑定 Backend 核心 C 上下文 API 接口（安全获取底层句柄）
+local ctx_uuid = backend.get_uuid                       -- 获取当前连接唯一的 UUID 标识
+local ctx_proxy_type = backend.get_proxy_type           -- 获取当前代理模式类型
+local ctx_address_type = backend.get_address_type       -- 获取目标地址类型 (IPv4/IPv6/域名)
+local ctx_address_host = backend.get_address_host       -- 获取目标主机名/域名/IP
+local ctx_address_bytes = backend.get_address_bytes     -- 获取目标原始字节格式地址
+local ctx_address_port = backend.get_address_port       -- 获取目标服务的端口号
+local ctx_write = backend.write                         -- 向底层代理通道写入数据
+local ctx_free = backend.free                           -- 释放底层上下文内存资源
+local ctx_debug = backend.debug                         -- 输出全局调试日志到控制台
+
+-- 【兼容性增强】：安全获取当前连接是否为 UDP 协议（若低版本框架未提供该接口则降级返回 false）
+local ctx_is_udp = backend.get_is_udp or function(ctx) return false end
+
+-- 初始化随机数种子，使用当前时间戳作为种子，防止系统重启后生成相同的伪随机序列
+math.randomseed(time())
+
+-- ==================== 2. 全局参数配置中心 ====================
+local CONFIG = {
+    -- 心跳保活时间间隔（单位：秒），用于定时向免流网关发送 PING 包，防止 NAT/网关超时断开连接
+    HEARTBEAT_INTERVAL = 25,
+
+    -- 免流伪装的目标百度核心节点 Host 与端口号（运营商白名单 IP）
+    BAIDU_HOST = "153.3.236.22:443",
+
+    -- 运营商免流网关校验头部 (X-T5-Auth 鉴权密匙)
+    T5_AUTH_KEY = "683556433",
+
+    -- 日志增强输出级别控制 (1: 仅错误 ALERT, 2: 关键信息 INFO, 3: 详细调试 DEBUG)
+    LOG_LEVEL = 3,
+
+    -- 是否开启客户端 TLS 指纹抗去匿名化（随机 Padding 填充长度，混淆报文特征）
+    ENABLE_FINGERPRINT_MASK = true
+}
+
+-- 真实百度客户端 User-Agent 动态伪装池（涵盖 Android、iOS、百度网盘等，用于随机切换）
+local BAIDU_UA_POOL = {
+    "baiduboxapp/8.5.0.0 (Linux; Android 12; Mi 13 Pro)",
+    "baiduboxapp/9.0.1.0 (Linux; Android 13; SM-S928B)",
+    "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Mobile Safari/537.36 baiduboxapp/8.2.5",
+    "baiduboxapp/7.8.5.0 (iPhone; iOS 16.5; Scale/3.00)",
+    "baiduboxapp/8.8.8.8 (Linux; Android 14; Pixel 8 Pro)",
+    "netdisk;11.18.3;android-android;12;Mobile"
+}
+
+-- 红果短剧及字节跳动全系视频/广告/CDN 特征域名关键字列表（用于触发 TCP 加强版伪装）
+local HK_DOMAINS = {
+    "zijie", "hongguo", "novel", "pangolin", "sigmob",
+    "amemv", "douyin", "iesdouyin", "byteimg",
+    "toutiao", "ixigua", "snssdk", "bdurl", "pstatp"
+}
+
+-- UDP 强伪装特定域名/应用关键字列表（匹配游戏、QUIC、实时音视频等 UDP 敏感流量）
+local UDP_MASK_DOMAINS = {
+    "udp", "quic", "game", "minecraft", "dota", "lol", 
+    "valorant", "genshin", "bilibili", "qpic", "video", "cdn", "streaming", "live"
+}
+
+-- 全局会话状态管理变量
+local flags = {}            -- 记录连接会话当前的握手状态
+local last_heartbeat = {}   -- 记录每个连接会话上次成功发送心跳包的时间戳
+local kHttpHeaderSent = 1   -- 状态常量：HTTP CONNECT 伪装头已发送
+local kHttpHeaderRecived = 2 -- 状态常量：代理网关响应已接收，握手成功完成
+
+-- ==================== 3. 工具函数与辅助算法 ====================
+
+---
+-- 【日志增强】：分级结构化日志输出函数
+-- @param level number 日志级别 (1: ALERT, 2: INFO, 3: DEBUG)
+-- @param msg string 打印的日志文本内容
+---
+local function log(level, msg)
+    if level <= CONFIG.LOG_LEVEL then
+        local prefix = "[INFO]"
+        if level == 1 then prefix = "[ALERT]" end
+        if level == 3 then prefix = "[DEBUG]" end
+        -- 调用底层代理系统的 debug 日志输出接口
+        ctx_debug(prefix .. " " .. msg)
+    end
+end
+
+---
+-- 【智能判断函数 1】：识别目标主机名是否属于红果短剧及字节系流量
+-- @param host string 目标主机名/域名
+-- @return boolean 是否命中了红果/字节系特征
+---
+local function is_hongguo_target(host)
+    if not host or host == "" then return false end     -- 安全边界校验：如果为空则返回 false
+    local h = lower(host)                               -- 将域名转为小写，防止大小写绕过
+    for _, domain_keyword in ipairs(HK_DOMAINS) do       -- 遍历红果短剧关键字列表
+        if find(h, domain_keyword, 1, true) then        -- 精确查找子字符串
+            return true                                 -- 命中则返回 true
+        end
+    end
+    return false                                        -- 未命中返回 false
+end
+
+---
+-- 【智能判断函数 2】：针对特定域名或 UDP 协议判定是否执行 UDP 免流强伪装
+-- @param host string 目标主机名/域名
+-- @return boolean 是否需要执行强伪装
+---
+local function is_udp_masquerade_target(host)
+    if not host or host == "" then return true end     -- 无法判定具体域名时（如纯 IP 访问），默认开启强伪装
+    local h = lower(host)                               -- 转换为小写字符串
+    for _, v in ipairs(UDP_MASK_DOMAINS) do            -- 遍历 UDP 敏感应用域名库
+        if find(h, v, 1, true) then
+            return true                                 -- 匹配成功，开启强伪装
+        end
+    end
+    return true                                         -- 默认对全部 UDP 流量应用免流伪装标头
+end
+
+---
+-- 【随机 TraceID】：生成随机 40 位十六进制字符串（完全符合百度系统 X-Bd-Traceid 格式规范）
+-- @return string 40 位随机 TraceID
+---
+local function generate_random_traceid()
+    local t = {}                                        -- 创建临时数组
+    for i = 1, 40 do                                    -- 循环 40 次生成 40 个十六进制字符
+        t[i] = random(0, 15)                            -- 产生 0-15 的随机整数
+    end
+    -- 格式化输出为 40 位的十六进制小写字符串
+    return string.format("%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x",
+        table.unpack(t))
+end
+
+---
+-- 【动态 User-Agent】：从 User-Agent 伪装池中随机抽取一个真实的百度 App UA 字符串
+-- @return string 随机选出的 UA
+---
+local function get_random_user_agent()
+    return BAIDU_UA_POOL[random(1, #BAIDU_UA_POOL)]     -- 从 UA 数组中随机取值并返回
+end
+
+---
+-- 【客户端 TLS 指纹抗去匿名化】：生成动态随机填充字节，打破 DPI 对报文固定长度分布的指纹识别
+-- @return string 随机长度填充标头
+---
+local function generate_random_padding()
+    if not CONFIG.ENABLE_FINGERPRINT_MASK then return "" end
+    local len = random(16, 64)                         -- 生成 16 至 64 字节的随机长度
+    return 'X-TLS-Padding: ' .. string.rep("x", len) .. '\r\n' -- 返回充当混淆 Payload 的头部
+end
+
+-- ==================== 4. Backend 代理生命周期核心回调实现 ====================
+
+---
+-- 回调 1: flags 处理回调函数
+-- 告诉代理底层此脚本支持直接写入操作（DIRECT_WRITE）
+---
+function wa_lua_on_flags_cb(ctx)
+    return DIRECT_WRITE                                 -- 返回 DIRECT_WRITE 常量，开启高性能写入模式
+end
+
+---
+-- 回调 2: 握手逻辑回调函数 (核心伪装报文构造)
+-- 当建立新连接时触发，结合 UDP 核心伪装、红果特征判断与防指纹填充，拼装 HTTP CONNECT 请求头
+---
+function wa_lua_on_handshake_cb(ctx)
+    local uuid = ctx_uuid(ctx)                          -- 获取当前连接会话的 UUID 唯一标识
+    local is_udp = ctx_is_udp(ctx)                      -- 检查当前连接是否为 UDP 协议数据包
+
+    -- 如果当前 UUID 的握手响应已经接收完毕，直接返回 true 代表握手完全结束
+    if flags[uuid] == kHttpHeaderRecived then
+        return true
+    end
+
+    -- 如果尚未发送 HTTP CONNECT 伪装请求头，则进行报文构建与发送
+    if flags[uuid] ~= kHttpHeaderSent then
+        local host = ctx_address_host(ctx)              -- 获取连接的目标真实主机/域名
+        local port = ctx_address_port(ctx)              -- 获取连接的目标真实端口
+
+        -- 智能决策：计算当前流量类型
+        local is_hg = is_hongguo_target(host)           -- 判定是否为红果短剧/字节系流量
+        local do_udp_mask = is_udp and is_udp_masquerade_target(host) -- 结合 UDP 协议与特定域名判定强伪装
+
+        -- 日志增强：格式化输出当前连接的详细特征
+        log(2, string.format("CONNECT -> %s:%d | UDP=%s | Mask=%s | HG_Target=%s",
+            tostring(host), tonumber(port), tostring(is_udp), tostring(do_udp_mask), tostring(is_hg)))
+
+        -- 动态生成本次连接专属的伪装参数
+        local traceid = generate_random_traceid()        -- 生成 40 位随机 TraceID
+        local ua = get_random_user_agent()              -- 选取随机 User-Agent
+        local padding_hdr = generate_random_padding()    -- 生成随机指纹填充串
+
+        local res = ""                                  -- 声明请求报文字符串变量
+
+        if do_udp_mask then
+            -- ==================== 策略 A: UDP 免流量核心强伪装报文 (融合参考脚本与新增强化) ====================
+            -- 模拟百度网盘及百度系内部 UDP 转发机制（标头叠加，极其逼真）
+            res = 'CONNECT ' .. host .. ':' .. port .. ' HTTP/1.1\r\n' ..
+                  'Host: ' .. CONFIG.BAIDU_HOST .. '\r\n' ..                  -- 百度免流 IP 白名单
+                  'Proxy-Connection: Keep-Alive\r\n' ..                       -- 保持长连接
+                  'Connection: keep-alive\r\n' ..                             -- HTTP 标准长连接标头
+                  'X-T5-Auth: ' .. CONFIG.T5_AUTH_KEY .. '\r\n' ..             -- 运营商免流鉴权 Key
+                  'User-Agent: ' .. ua .. '\r\n' ..                            -- 随机百度 App 真实 UA
+                  'X-Bd-Traceid: ' .. traceid .. '\r\n' ..                     -- 动态 40 位随机 TraceID
+                  'X-Bd-Product: BDUSS\r\n' ..                                -- 百度产品类型标识
+                  'X-Bd-Uid: 0\r\n' ..                                        -- 百度 UID 标识
+                  'X-Bd-Client-Type: UDP-TRANS\r\n' ..                        -- 核心 UDP 传输特征标头
+                  'X-Bd-Trans-Type: masquerade\r\n' ..                       -- 核心 UDP 伪装模式标头
+                  'X-Bd-Request-Mode: tunnel\r\n' ..                          -- 核心隧道模式标头
+                  'X-TLS-Version: TLSv1.3\r\n' ..                             -- TLS 1.3 协议伪装指示
+                  padding_hdr ..                                              -- 抗去匿名化随机填充
+                  'Accept: */*\r\n' ..
+                  'Content-Length: 0\r\n' ..
+                  '\r\n'
+
+        elseif is_hg then
+            -- ==================== 策略 B: 红果短剧 / 字节系流量专属 TCP 加强报文 ====================
+            res = 'CONNECT ' .. host .. ':' .. port .. ' HTTP/1.1\r\n' ..
+                  'Host: ' .. CONFIG.BAIDU_HOST .. '\r\n' ..
+                  'Proxy-Connection: Keep-Alive\r\n' ..
+                  'Connection: keep-alive\r\n' ..
+                  'X-T5-Auth: ' .. CONFIG.T5_AUTH_KEY .. '\r\n' ..
+                  'User-Agent: ' .. ua .. '\r\n' ..
+                  'X-Bd-Traceid: ' .. traceid .. '\r\n' ..
+                  'X-Bd-Product: BDUSS\r\n' ..
+                  'X-Bd-Uid: 0\r\n' ..
+                  'X-TLS-Version: TLSv1.3\r\n' ..
+                  padding_hdr ..
+                  'Accept: */*\r\n' ..
+                  '\r\n'
+
+        else
+            -- ==================== 策略 C: 普通 TCP 免流标准伪装报文 ====================
+            res = 'CONNECT ' .. host .. ':' .. port .. ' HTTP/1.1\r\n' ..
+                  'Host: ' .. CONFIG.BAIDU_HOST .. '\r\n' ..
+                  'Proxy-Connection: Keep-Alive\r\n' ..
+                  'Connection: keep-alive\r\n' ..
+                  'X-T5-Auth: ' .. CONFIG.T5_AUTH_KEY .. '\r\n' ..
+                  'User-Agent: ' .. ua .. '\r\n' ..
+                  'X-Bd-Traceid: ' .. traceid .. '\r\n' ..
+                  'X-TLS-Version: TLSv1.3\r\n' ..
+                  padding_hdr ..
+                  '\r\n'
+        end
+
+        -- 将拼装好的伪装请求报文写入底层套接字发送给免流网关
+        ctx_write(ctx, res)
+        -- 将当前会话状态更新为：HTTP 伪装头已发送
+        flags[uuid] = kHttpHeaderSent
+        -- 记录初始心跳时间戳
+        last_heartbeat[uuid] = time()
+        log(3, "HTTP CONNECT Header written to socket for UUID: " .. tostring(uuid))
+    end
+
+    return false                                        -- 返回 false 表示当前握手尚未全部完成，继续等待响应
+end
+
+---
+-- 回调 3: 数据读取与心跳驱动回调函数
+-- 处理免流网关返回的响应，并在数据传输阶段定期注入心跳保活数据包，过滤异常探测包
+---
+function wa_lua_on_read_cb(ctx, buf)
+    local uuid = ctx_uuid(ctx)                          -- 获取当前连接会话的 UUID
+    local now = time()                                  -- 获取系统当前时间戳
+
+    -- 如果处于已发送请求头状态，此时收到的数据即为代理网关的 HTTP 响应（如 200 Connection Established）
+    if flags[uuid] == kHttpHeaderSent then
+        flags[uuid] = kHttpHeaderRecived                -- 标记状态为：响应已接收，握手成功
+        log(2, "Handshake completed successfully for session: " .. tostring(uuid))
+        return HANDSHAKE, nil                           -- 返回 HANDSHAKE 状态，告知代理框架握手完成
+    end
+
+    -- ==================== UDP / TCP 全路心跳保活逻辑 ====================
+    -- 判断当前会话是否存在心跳记录，且距上次心跳发送时间超过了配置的时间间隔
+    if last_heartbeat[uuid] and (now - last_heartbeat[uuid] >= CONFIG.HEARTBEAT_INTERVAL) then
+        ctx_write(ctx, "\r\n")                         -- 向底层通道写入空换行符作为心跳 PING 包
+        last_heartbeat[uuid] = now                       -- 更新上次心跳时间戳
+        log(3, "Sent keep-alive heartbeat ping for UUID: " .. tostring(uuid))
+    end
+
+    -- 空数据包处理与保护
+    if buf == nil then return DIRECT, nil end            -- 如果读取到的缓冲区为空，直接透传 nil
+    if #buf == 0 then return DIRECT, '' end             -- 如果读取到的数据长度为 0，透传空字符串
+
+    -- ==================== UDP 伪装模式下过滤探测包 / 防火墙拦截检测 ====================
+    local is_udp = ctx_is_udp(ctx)
+    if #buf < 2000 and find(buf, "HTTP/", 1, true) == 1 then
+        if is_udp then
+            log(1, "UDP masquerade warning: Received unexpected HTTP response on UDP tunnel.")
+        else
+            log(1, "ALERT: Plaintext HTTP response intercepted in stream! Possible DPI / Firewall interference.")
+        end
+    end
+
+    -- 正常数据透传阶段：返回 DIRECT 常量及原样数据缓冲区
+    return DIRECT, buf
+end
+
+---
+-- 回调 4: 数据写入回调函数
+-- 代理客户端向远程目标发送数据时触发，直接透传数据
+---
+function wa_lua_on_write_cb(ctx, buf)
+    return DIRECT, buf                                  -- 直接透传写入数据
+end
+
+---
+-- 回调 5: 连接关闭回调函数
+-- 当连接断开时清理内存与状态记录，防止 Lua 虚拟机发生内存泄漏
+---
+function wa_lua_on_close_cb(ctx)
+    local uuid = ctx_uuid(ctx)                          -- 获取连接 UUID
+    if uuid then
+        flags[uuid] = nil                               -- 释放握手状态机记录
+        last_heartbeat[uuid] = nil                      -- 释放心跳保活时间戳记录
+        log(3, "Session closed and state resources freed for UUID: " .. tostring(uuid))
+    end
+    ctx_free(ctx)                                       -- 调用底层接口释放 C 层的上下文结构体内存
+    return SUCCESS                                      -- 返回成功码
+end
