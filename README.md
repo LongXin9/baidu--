@@ -13,12 +13,3 @@ https://raw.githubusercontent.com/LongXin9/baidu--/refs/heads/main/Shadowrocket-
 
 **Shadowrocket-baidu-standalone-udp：**
 https://raw.githubusercontent.com/LongXin9/baidu--/refs/heads/main/Shadowrocket-baidu-standalone-udp
-
-**Loon-baidu-weizhuang：**
-https://raw.githubusercontent.com/LongXin9/baidu--/refs/heads/main/Loon-baidu-weizhuang.js
-
-**Loon-baidu-udp：**
-https://raw.githubusercontent.com/LongXin9/baidu--/refs/heads/main/Loon-baidu-udp
-
-**Loon-baidu-standaloe-udp：**
-https://raw.githubusercontent.com/LongXin9/baidu--/refs/heads/main/Loon-baidu-standaloe-udp
