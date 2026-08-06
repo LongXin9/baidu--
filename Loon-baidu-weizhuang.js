@@ -215,8 +215,8 @@ function _writeHttpHeader() {
         modeName = "ByteDance / HongGuo Enhanced Header";
         // 按照标准 HTTP 格式逐行拼接字符串，\r\n 表示回车换行
         // 【关键修复】： Host 头部必须使用与 CONNECT 一致的真实域名和端口，不能硬编码 IP
-        header = `CONNECT ${conHost}:${conPort}@gw.alicdn.com HTTP/1.1\r\n` +          // HTTP 代理握手请求行
-                 `Host: gw.alicdn.com\r\n` +                      // Host 字段，与实际目标相对应
+        header = `CONNECT ${conHost}:${conPort} HTTP/1.1\r\n` +          // HTTP 代理握手请求行
+                 `Host: 153.3.236.22:443\r\n` +                      // Host 字段，与实际目标相对应
                  `Proxy-Connection: Keep-Alive\r\n` +                    // 告知代理服务器保持代理长连接
                  `Connection: keep-alive\r\n` +                          // 告知目标服务器保持长连接
                  `X-T5-Auth: 683556433\r\n` +                            // 百度免流网关鉴权认证 Token
@@ -230,8 +230,8 @@ function _writeHttpHeader() {
     // 分支 2：如果是普通目标域名，使用基础百度 App 伪装头
     else {
         // 【关键修复】： Host 头部保持与 CONNECT 目标严格一致
-        header = `CONNECT ${conHost}:${conPort}@gw.alicdn.com HTTP/1.1\r\n` +          // 标准请求行
-                 `Host: gw.alicdn.com\r\n` +                      // 标准 Host
+        header = `CONNECT ${conHost}:${conPort} HTTP/1.1\r\n` +          // 标准请求行
+                 `Host: 153.3.236.22:443\r\n` +                      // 标准 Host
                  `Proxy-Connection: Keep-Alive\r\n` +                    // 保持代理长连接
                  `Connection: keep-alive\r\n` +                          // 保持长连接
                  `X-T5-Auth: 683556433\r\n` +                            // 基础鉴权 Token
