@@ -1,54 +1,57 @@
 /**
- * 高级免流混淆脚本 (Loon Custom 协议)
- * 增加：抗去匿名化混淆、动态 UA/TraceID、HTTP 代理连接保活
+ * 高级免流混淆脚本 (Loon Custom 协议 - 语法修复与日志集成版)
+ * 增加：抗去匿名化混淆、动态 UA/TraceID、HTTP 代理连接保活、全链路调试日志
  */
 
-let HTTP_STATUS_INVALID = -1
-let HTTP_STATUS_CONNECTED = 0
-let HTTP_STATUS_WAITRESPONSE = 1
-let HTTP_STATUS_FORWARDING = 2
-var httpStatus = HTTP_STATUS_INVALID
+// ==================== 一、 Session 状态常量定义 ====================
+const HTTP_STATUS_INVALID = -1;
+const HTTP_STATUS_CONNECTED = 0;
+const HTTP_STATUS_WAITRESPONSE = 1;
+const HTTP_STATUS_FORWARDING = 2;
 
-// 域名特征列表
+// 统一日志前缀，便于在 Loon 日志面板筛选
+const LOG_PREFIX = "[Baidu-AntiDeAnon]";
+
+// ==================== 二、 特征库与动态生成池 ====================
 const HK_DOMAINS = [
     "zijie", "hongguo", "novel", "pangolin", "sigmob",
     "amemv", "douyin", "iesdouyin", "byteimg",
     "toutiao", "ixigua", "snssdk", "bdurl"
-]
-const UDP_TARGETS = ["udp", "quic", "game", "minecraft", "dota", "lol", "valorant", "genshin"]
+];
 
-// 动态 UA 生成池
+const UDP_TARGETS = [
+    "udp", "quic", "game", "minecraft", "dota", 
+    "lol", "valorant", "genshin"
+];
+
 const BAIDU_UA_VERSIONS = [
     "baiduboxapp/13.25.0.10 (Linux; U; Android 13; zh_CN; M2012K11C)",
     "baiduboxapp/13.30.5.11 (Linux; U; Android 14; zh_CN; 2304FPN6DC)",
     "baiduboxapp/14.2.0.10 (iPhone; CPU iPhone OS 16_6 like Mac OS X) Mobile/15E148",
     "baiduboxapp/14.5.1.12 (iPhone; CPU iPhone OS 17_2 like Mac OS X) Mobile/15E148",
     "baiduboxapp/13.18.0.10 (Linux; U; Android 12; zh_CN; SM-G9980)"
-]
+];
 
-// ==================== 实用辅助工具函数 ====================
+// ==================== 三、 实用辅助工具函数 ====================
 
 /**
  * 生成 32 位十六进制动态 TraceID (抗 DPI 模式匹配)
  */
 function generateDynamicTraceId() {
-    const chars = '0123456789abcdef'
-    let traceId = ''
+    const chars = '0123456789abcdef';
+    let traceId = '';
     for (let i = 0; i < 32; i++) {
-        traceId += chars.charAt(Math.floor(Math.random() * chars.length))
+        traceId += chars.charAt(Math.floor(Math.random() * chars.length));
     }
-    return traceId
+    return traceId;
 }
 
-/**
- * 获取随机数/字符串
- */
 function getRandomInt(min, max) {
-    return Math.floor(Math.random() * (max - min + 1)) + min
+    return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
 function getRandomUA() {
-    return BAIDU_UA_VERSIONS[Math.floor(Math.random() * BAIDU_UA_VERSIONS.length)]
+    return BAIDU_UA_VERSIONS[Math.floor(Math.random() * BAIDU_UA_VERSIONS.length)];
 }
 
 /**
@@ -59,87 +62,124 @@ function shuffleHeaders(headerArray) {
         const j = Math.floor(Math.random() * (i + 1));
         [headerArray[i], headerArray[j]] = [headerArray[j], headerArray[i]];
     }
-    return headerArray
+    return headerArray;
 }
 
 function isHongguoTarget(host) {
-    if (!host) return false
-    const h = host.toLowerCase()
-    return HK_DOMAINS.some(v => h.includes(v))
+    if (!host) return false;
+    const h = host.toLowerCase();
+    return HK_DOMAINS.some(v => h.includes(v));
 }
 
 function isUdpMasqueradeTarget(host, isUdp) {
-    if (!isUdp) return false
-    if (!host) return true
-    const h = host.toLowerCase()
-    return UDP_TARGETS.some(v => h.includes(v)) || true
+    if (!isUdp) return false;
+    if (!host) return true;
+    const h = host.toLowerCase();
+    return UDP_TARGETS.some(v => h.includes(v)) || true;
 }
 
-// ==================== Loon 生命周期回调 ====================
+// ==================== 四、 Loon 生命周期回调函数 ====================
 
+/**
+ * 回调 1：TCP 连接成功
+ */
 function tunnelDidConnected() {
+    const target = `${$session.conHost}:${$session.conPort}`;
+    console.log(`${LOG_PREFIX} ➔ [TCP 连通] 代理底层 Socket 已连接 | 目标: ${target}`);
+
     if ($session.proxy.isTLS) {
-        // TLS 连接
+        console.log(`${LOG_PREFIX} [TLS 模式] 底层 TCP 就绪，等待 TLS 握手...`);
     } else {
-        _writeHttpHeader()
-        httpStatus = HTTP_STATUS_CONNECTED
+        console.log(`${LOG_PREFIX} [明文 HTTP 模式] 开始构建并发送动态伪装头...`);
+        _writeHttpHeader();
+        // 关键修复：将握手状态存入独立的 session 上下文中
+        $session.httpStatus = HTTP_STATUS_CONNECTED;
     }
-    return true
+    return true;
 }
 
+/**
+ * 回调 2：TLS 加密完成
+ */
 function tunnelTLSFinished() {
-    _writeHttpHeader()
-    httpStatus = HTTP_STATUS_CONNECTED
-    return true
+    const target = `${$session.conHost}:${$session.conPort}`;
+    console.log(`${LOG_PREFIX} ➔ [TLS 完成] 安全通道已就绪，发送加密伪装头 | 目标: ${target}`);
+    
+    _writeHttpHeader();
+    $session.httpStatus = HTTP_STATUS_CONNECTED;
+    return true;
 }
 
+/**
+ * 回调 3：收到代理服务器下发的数据
+ */
 function tunnelDidRead(data) {
-    if (httpStatus === HTTP_STATUS_WAITRESPONSE) {
-        console.log(`[Baidu-AntiDeAnon] 代理握手成功: ${$session.conHost}:${$session.conPort}`)
-        httpStatus = HTTP_STATUS_FORWARDING
-        $tunnel.established($session)
-        return null // 截断代理层 CONNECT 200 回包，透传后续数据
-    } else if (httpStatus === HTTP_STATUS_FORWARDING) {
-        return data
+    const target = `${$session.conHost}:${$session.conPort}`;
+
+    if ($session.httpStatus === HTTP_STATUS_WAITRESPONSE) {
+        console.log(`${LOG_PREFIX} ✔ [握手成功] 收到代理网关 200 OK | 目标: ${target}`);
+        console.log(`${LOG_PREFIX} [通道建立] 调用 $tunnel.established() 并拦截响应头`);
+        
+        $session.httpStatus = HTTP_STATUS_FORWARDING;
+        $tunnel.established($session);
+        return null; // 截断代理层 CONNECT 200 回包，避免打断 App
+    } else if ($session.httpStatus === HTTP_STATUS_FORWARDING) {
+        return data;
     }
+
+    // 关键修复：显式兜底返回 data，防止隐式返回 undefined 导致丢包
+    return data;
 }
 
+/**
+ * 回调 4：写入数据成功回调
+ */
 function tunnelDidWrite() {
-    if (httpStatus === HTTP_STATUS_CONNECTED) {
-        httpStatus = HTTP_STATUS_WAITRESPONSE
-        $tunnel.readTo($session, "\x0D\x0A\x0D\x0A") // 读取至 HTTP 报头结束符
-        return false
+    const target = `${$session.conHost}:${$session.conPort}`;
+
+    if ($session.httpStatus === HTTP_STATUS_CONNECTED) {
+        console.log(`${LOG_PREFIX} ⬆ [伪装头已发送] 正在等待代理网关返回 200 回包... | 目标: ${target}`);
+        $session.httpStatus = HTTP_STATUS_WAITRESPONSE;
+        $tunnel.readTo($session, "\r\n\r\n"); // 读取至 HTTP 报头结束符
+        return false; // 暂停写回调
     }
-    return true
+    return true;
 }
 
+/**
+ * 回调 5：连接关闭
+ */
 function tunnelDidClose() {
-    httpStatus = HTTP_STATUS_INVALID
-    return true
+    const target = `${$session.conHost}:${$session.conPort}`;
+    console.log(`${LOG_PREFIX} ✖ [连接断开] Session 已清理 | 目标: ${target}`);
+    
+    $session.httpStatus = HTTP_STATUS_INVALID;
+    return true;
 }
 
-// ==================== 核心：伪装头构造与动态混淆 ====================
+// ==================== 五、 核心：伪装头构造与动态混淆 ====================
 
 function _writeHttpHeader() {
-    const host = $session.conHost
-    const port = $session.conPort
-    const isUdp = $session.type === 1 || $session.isUdp === true
+    const host = $session.conHost;
+    const port = $session.conPort;
+    const isUdp = $session.type === 1 || $session.isUdp === true;
 
-    const isHg = isHongguoTarget(host)
-    const doUdpMask = isUdpMasqueradeTarget(host, isUdp)
+    const isHg = isHongguoTarget(host);
+    const doUdpMask = isUdpMasqueradeTarget(host, isUdp);
 
     // 1. 动态变量生成
-    const dynamicTraceId = generateDynamicTraceId()
-    const dynamicUA = getRandomUA()
-    const dynamicUid = getRandomInt(10000000, 99999999).toString()
-    const randomNonce = getRandomInt(1000, 9999)
+    const dynamicTraceId = generateDynamicTraceId();
+    const dynamicUA = getRandomUA();
+    const dynamicUid = getRandomInt(10000000, 99999999).toString();
+    const randomNonce = getRandomInt(1000, 9999);
 
     // 2. 基础请求首行
-    const requestLine = `CONNECT ${host}:${port} HTTP/1.1\r\n`
+    const requestLine = `CONNECT ${host}:${port} HTTP/1.1\r\n`;
 
     // 3. 构建可乱序混淆的请求头集合
+    // 关键修复：Host 必须动态对应实际目标 ${host}:${port}，严禁硬编码 IP
     let headersMap = [
-        `Host: 153.3.236.22:443`,
+        `Host: ${host}:${port}`,
         `Proxy-Connection: Keep-Alive`,
         `Connection: keep-alive`,
         `X-T5-Auth: 683556433`,
@@ -148,32 +188,37 @@ function _writeHttpHeader() {
         `X-Bd-Product: BDUSS`,
         `X-Bd-Uid: ${dynamicUid}`,
         `Accept: */*`
-    ]
+    ];
 
     // 针对 UDP / 字节系特定场景加入特征与抗指纹扰动项
+    let modeTag = "Standard-TCP";
     if (doUdpMask) {
-        headersMap.push(`X-Bd-Client-Type: UDP-TRANS`)
-        headersMap.push(`X-Bd-Trans-Type: masquerade`)
-        headersMap.push(`X-Bd-Request-Mode: tunnel`)
-        headersMap.push(`Content-Length: 0`)
-        headersMap.push(`X-Bd-Nonce: ${randomNonce}`) // 抗重放与去匿名化扰动字段
+        modeTag = "UDP-Masquerade";
+        headersMap.push(`X-Bd-Client-Type: UDP-TRANS`);
+        headersMap.push(`X-Bd-Trans-Type: masquerade`);
+        headersMap.push(`X-Bd-Request-Mode: tunnel`);
+        headersMap.push(`Content-Length: 0`);
+        headersMap.push(`X-Bd-Nonce: ${randomNonce}`);
     } else if (isHg) {
-        headersMap.push(`X-Bd-Feature: hongguo-v2`)
-        headersMap.push(`X-Bd-Client-Type: TCP-STRENGTH`)
-        headersMap.push(`X-Bd-Nonce: ${randomNonce}`)
+        modeTag = "HongGuo-TCP-Enhanced";
+        headersMap.push(`X-Bd-Feature: hongguo-v2`);
+        headersMap.push(`X-Bd-Client-Type: TCP-STRENGTH`);
+        headersMap.push(`X-Bd-Nonce: ${randomNonce}`);
     } else {
-        headersMap.push(`X-Bd-Nonce: ${randomNonce}`)
+        headersMap.push(`X-Bd-Nonce: ${randomNonce}`);
     }
 
-    // 4. 打乱部分非关键 Header 顺序（保持第一个 Host 为基准，防止极少数严格网关解析报错）
-    const hostHeader = headersMap.shift() // 提取 Host
-    headersMap = shuffleHeaders(headersMap) // 打乱其余 Header
-    headersMap.unshift(hostHeader) // 放回 Host
+    // 4. 打乱部分非关键 Header 顺序（保持第一个 Host 为基准）
+    const hostHeader = headersMap.shift(); // 提取 Host
+    headersMap = shuffleHeaders(headersMap); // 打乱其余 Header
+    headersMap.unshift(hostHeader); // 放回 Host
 
     // 5. 组合最终请求报文
-    const finalHeader = requestLine + headersMap.join("\r\n") + "\r\n\r\n"
+    const finalHeader = requestLine + headersMap.join("\r\n") + "\r\n\r\n";
 
-    console.log(`[Baidu-AntiDeAnon] 发送伪装头 | TraceID: ${dynamicTraceId.substring(0, 8)}... | Mode: ${doUdpMask ? 'UDP-Mask' : (isHg ? 'HG-TCP' : 'Standard')}`)
+    // 打印调试日志与报文结构
+    console.log(`${LOG_PREFIX} ⚙ [匹配模式: ${modeTag}] -> Target: ${host}:${port} | TraceID: ${dynamicTraceId.substring(0, 8)}...`);
+    console.log(`${LOG_PREFIX} 📝 [乱序 Header 报文 Preview]:\n${finalHeader.replace(/\r\n/g, " \\r\\n ")}`);
 
-    $tunnel.write($session, finalHeader)
+    $tunnel.write($session, finalHeader);
 }
