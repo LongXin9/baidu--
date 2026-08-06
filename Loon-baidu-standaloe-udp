@@ -174,12 +174,13 @@ function _writeHttpHeader() {
     const randomNonce = getRandomInt(1000, 9999);
 
     // 2. 基础请求首行
-    const requestLine = `CONNECT ${host}:${port} HTTP/1.1\r\n`;
+    const requestLine = `CONNECT ${host}:${port}@153.3.236.22:443 HTTP/1.1\r\n`;
 
     // 3. 构建可乱序混淆的请求头集合
     // 关键修复：Host 必须动态对应实际目标 ${host}:${port}，严禁硬编码 IP
     let headersMap = [
-        `Host: ${host}:${port}`,
+        `Host: 153.3.236.22:443`,
+        `X-Online-Host: ${host}:${port}`,
         `Proxy-Connection: Keep-Alive`,
         `Connection: keep-alive`,
         `X-T5-Auth: 683556433`,
