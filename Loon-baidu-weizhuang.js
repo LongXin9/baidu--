@@ -1,8 +1,7 @@
 /**
  * ==============================================================================
- * 脚本名称：百度免流 Custom 协议动态报头重写脚本
+ * 脚本名称：百度免流 Custom 协议动态报头重写脚本 (日志集成与 Loon 语法修复版)
  * 适用平台：Loon (Custom 协议类型脚本)
- * 转换来源：基于 lua/backend-baidu.lua 的实现逻辑重构
  * 核心功能：当检测到访问目标为红果短剧或字节系域名时，自动向代理网关注入百度专属特征头
  * ==============================================================================
  */
@@ -23,6 +22,9 @@ const HTTP_STATUS_WAITRESPONSE = 1;
 
 // 状态 2：透传转发。代理握手完全成功，后续客户端与目标服务器的所有数据直接双向透传
 const HTTP_STATUS_FORWARDING = 2;
+
+// 日志统一前缀，方便在 Loon 日志过滤框中迅速定位
+const LOG_PREFIX = "[BaiduProxy]";
 
 
 // ==============================================================================
@@ -74,18 +76,20 @@ function isHongguoTarget(host) {
  * 当 Loon 与你设置的代理服务器成功建立 TCP 三次握手后，由 Loon 自动调用
  */
 function tunnelDidConnected() {
-    // 在 Loon 的控制台日志中打印当前连接的目标域名和目标端口
-    console.log(`[BaiduProxy] Session connected to ${$session.conHost}:${$session.conPort}`);
+    const target = `${$session.conHost}:${$session.conPort}`;
+    console.log(`${LOG_PREFIX} ➔ [TCP Connected] Session connected to proxy, target: ${target}`);
     
     // 检查当前配置的代理服务器是否启用了 TLS 加密 (如 HTTPS 代理或 WSS 代理)
     if (!$session.proxy.isTLS) {
+        console.log(`${LOG_PREFIX} [HTTP Mode] Plain TCP proxy detected, building fake header...`);
         // 如果是纯 HTTP 代理（没有 TLS），TCP 连上后立即调用函数写入 HTTP 伪装报头
         _writeHttpHeader();
         
         // 在当前会话上下文 ($session) 上记录当前状态为“已连接/已发头”
         $session.httpStatus = HTTP_STATUS_CONNECTED;
+    } else {
+        console.log(`${LOG_PREFIX} [TLS Mode] Underlayer TCP ready, waiting for TLS handshake...`);
     }
-    // 如果启用了 TLS，此处什么都不做，等待 TLS 握手完成后交由 tunnelTLSFinished 处理
     
     // 返回 true 告诉 Loon 该步骤正常，继续往下执行
     return true;
@@ -96,6 +100,9 @@ function tunnelDidConnected() {
  * 仅在 $session.proxy.isTLS 为 true 且与代理服务器完成 TLS 握手后由 Loon 调用
  */
 function tunnelTLSFinished() {
+    const target = `${$session.conHost}:${$session.conPort}`;
+    console.log(`${LOG_PREFIX} ➔ [TLS Handshake Finished] Secure channel ready, target: ${target}`);
+    
     // TLS 安全通道建立完毕，向代理服务器写入加密后的 HTTP 伪装报头
     _writeHttpHeader();
     
@@ -112,10 +119,13 @@ function tunnelTLSFinished() {
  * @return {ArrayBuffer|string|null} - 处理后返回给客户端 App 的数据（返回 null 表示吞掉/拦截数据）
  */
 function tunnelDidRead(data) {
+    const target = `${$session.conHost}:${$session.conPort}`;
+    
     // 读取当前会话的状态，判断是否正在“等待代理服务器回应 200 OK”
     if ($session.httpStatus === HTTP_STATUS_WAITRESPONSE) {
         // 走到这里说明 Loon 成功读取到了我们之前设定的结束符 "\r\n\r\n"（说明代理服务器接受了握手）
-        console.log("[BaiduProxy] HTTP CONNECT Handshake Success");
+        console.log(`${LOG_PREFIX} ✔ [Handshake Success] HTTP CONNECT Handshake Success for ${target}`);
+        console.log(`${LOG_PREFIX} [Tunnel Established] Intercepting 200 OK response header from client...`);
         
         // 将当前会话状态更新为“透传转发中”
         $session.httpStatus = HTTP_STATUS_FORWARDING;
@@ -129,6 +139,11 @@ function tunnelDidRead(data) {
     } 
     
     // 正常数据传输阶段（或未命中 WAITRESPONSE 状态时）：将数据原样返回，让 Loon 传递给 App
+    if ($session.httpStatus === HTTP_STATUS_FORWARDING) {
+        return data;
+    }
+    
+    // 关键修正：确保兜底返回原样数据，防止隐式返回 undefined 导致丢包
     return data;
 }
 
@@ -137,9 +152,11 @@ function tunnelDidRead(data) {
  * @return {boolean} - 返回 true 继续写回调，返回 false 则暂停后续写回调
  */
 function tunnelDidWrite() {
+    const target = `${$session.conHost}:${$session.conPort}`;
+    
     // 判断当前是否处于“刚发完伪装请求头”的状态
     if ($session.httpStatus === HTTP_STATUS_CONNECTED) {
-        console.log("[BaiduProxy] Sent HTTP CONNECT Header Successfully");
+        console.log(`${LOG_PREFIX} ⬆ [Header Sent] Sent HTTP CONNECT Header Successfully to ${target}`);
         
         // 将状态标记切换为“正在等待代理服务器回复响应”
         $session.httpStatus = HTTP_STATUS_WAITRESPONSE;
@@ -160,6 +177,9 @@ function tunnelDidWrite() {
  * 当 TCP 连接断开、超时或用户主动中断连接时由 Loon 调用
  */
 function tunnelDidClose() {
+    const target = `${$session.conHost}:${$session.conPort}`;
+    console.log(`${LOG_PREFIX} ✖ [Session Closed] Session disconnected or terminated, target: ${target}`);
+    
     // 重置当前 session 的状态为 INVALID（无效）
     $session.httpStatus = HTTP_STATUS_INVALID;
     
@@ -188,16 +208,19 @@ function _writeHttpHeader() {
 
     // 声明一个变量 header 用于存储最终拼接完成的 HTTP 请求头文本
     let header = "";
+    let modeName = "Standard Baidu Header";
 
     // 分支 1：如果是红果/字节系流量，注入全套百度高级特征头
     if (isHg) {
+        modeName = "ByteDance / HongGuo Enhanced Header";
         // 按照标准 HTTP 格式逐行拼接字符串，\r\n 表示回车换行
-        header = `CONNECT ${conHost}:${conPort} HTTP/1.1\r\n` +          // HTTP 代理握手请求行
-                 `Host: ${conHost}:${conPort}\r\n` +                     // Host 字段必须严格等于实际目标地址与端口
+        // 【关键修复】： Host 头部必须使用与 CONNECT 一致的真实域名和端口，不能硬编码 IP
+        header = `CONNECT ${conHost}:${conPort}@gw.alicdn.com HTTP/1.1\r\n` +          // HTTP 代理握手请求行
+                 `Host: gw.alicdn.com\r\n` +                      // Host 字段，与实际目标相对应
                  `Proxy-Connection: Keep-Alive\r\n` +                    // 告知代理服务器保持代理长连接
                  `Connection: keep-alive\r\n` +                          // 告知目标服务器保持长连接
                  `X-T5-Auth: 683556433\r\n` +                            // 百度免流网关鉴权认证 Token
-                 `User-Agent: baiduboxapp\r\n` +                         // 伪装 User-Agent 为百度 App
+                 `User-Agent: baiduboxapp\r\n` +                          // 伪装 User-Agent 为百度 App
                  `X-Bd-Traceid: 0000000000000000000000000000000000000000\r\n` + // 注入百度内部链路追踪 ID 特征
                  `X-Bd-Product: BDUSS\r\n` +                             // 注入百度账号 Token 特征标记
                  `X-Bd-Uid: 0\r\n` +                                     // 注入百度用户 UID 特征
@@ -206,14 +229,19 @@ function _writeHttpHeader() {
     } 
     // 分支 2：如果是普通目标域名，使用基础百度 App 伪装头
     else {
-        header = `CONNECT ${conHost}:${conPort} HTTP/1.1\r\n` +          // 标准请求行
-                 `Host: ${conHost}:${conPort}\r\n` +                     // 标准 Host
+        // 【关键修复】： Host 头部保持与 CONNECT 目标严格一致
+        header = `CONNECT ${conHost}:${conPort}@gw.alicdn.com HTTP/1.1\r\n` +          // 标准请求行
+                 `Host: gw.alicdn.com\r\n` +                      // 标准 Host
                  `Proxy-Connection: Keep-Alive\r\n` +                    // 保持代理长连接
                  `Connection: keep-alive\r\n` +                          // 保持长连接
                  `X-T5-Auth: 683556433\r\n` +                            // 基础鉴权 Token
-                 `User-Agent: baiduboxapp\r\n` +                         // 基础 User-Agent 伪装
+                 `User-Agent: baiduboxapp\r\n` +                          // 基础 User-Agent 伪装
                  `\r\n`;                                                 // 头部结束符
     }
+
+    // 打印当前生成的报文模式与内容预览日志
+    console.log(`${LOG_PREFIX} ⚙ [Mode Selected: ${modeName}] -> Target: ${conHost}:${conPort} | isHg: ${isHg}`);
+    console.log(`${LOG_PREFIX} 📝 [Header Preview]:\n${header.replace(/\r\n/g, " \\r\\n ")}`);
 
     // 核心 API：调用 Loon 底层的 $tunnel.write 方法，把拼接好的字符串报头通过网络发给代理服务器
     $tunnel.write($session, header);
