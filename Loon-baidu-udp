@@ -1,270 +1,215 @@
 /**
  * ==============================================================================
- * 脚本名称：百度/字节系 HTTP & UDP 动态免流 Custom 协议脚本
+ * 脚本名称：百度/字节系 HTTP & UDP 动态免流 Custom 协议脚本 (带调试日志集成版)
  * 运行平台：Loon (Custom 协议类型)
  * 核心功能：
  *   1. 自动识别 TCP 流量中的字节系/红果短剧域名，动态注入百度高级特征头；
  *   2. 自动识别并为 UDP / QUIC / 游戏流量构建伪装报文，支持免流透传；
- *   3. 严格遵循 HTTP/1.1 规范与 Loon 上下文隔离机制，避免并发混乱。
+ *   3. 集成全链路 console.log 日志，支持在 Loon 日志面板实时排查调试。
  * ==============================================================================
  */
 
 // ==============================================================================
 // 一、 握手状态常量定义 (Session State Constants)
-// 作用：统一定义握手生命周期中的各种状态代码
 // ==============================================================================
+const HTTP_STATUS_INVALID = -1;     // 状态：无效/未建立连接
+const HTTP_STATUS_CONNECTED = 0;   // 状态：已建立 TCP，已发送请求头
+const HTTP_STATUS_WAITRESPONSE = 1; // 状态：等待代理服务器回复 200 OK
+const HTTP_STATUS_FORWARDING = 2;   // 状态：握手成功，双向透传中
 
-// 状态 -1：无效/初始化状态。表示连接未就绪、连接失败或已被重置关闭
-const HTTP_STATUS_INVALID = -1;
-
-// 状态 0：已连接状态。底层 TCP 建立完成，伪装 CONNECT 报头已写入网关
-const HTTP_STATUS_CONNECTED = 0;
-
-// 状态 1：等待响应状态。伪装报头已发出，正在挂起并等待代理网关回复 200 OK 响应
-const HTTP_STATUS_WAITRESPONSE = 1;
-
-// 状态 2：透传转发状态。握手确认成功，后续流量直接进入双向高效率数据透传
-const HTTP_STATUS_FORWARDING = 2;
-
+// 日志前缀常量，便于在 Loon 日志面板筛选
+const LOG_PREFIX = "[Baidu-Fake]";
 
 // ==============================================================================
 // 二、 目标域名与流量特征规则库 (Match Rules)
 // ==============================================================================
-
-// 定义字节系及红果短剧特征域名列表
 const HK_DOMAINS = [
-    "zijie",    // 字节跳动相关服务
-    "hongguo",  // 红果短剧 App
-    "novel",    // 番茄小说/短剧相关域名
-    "pangolin", // 穿山甲广告 SDK
-    "sigmob",   // 移动广告联盟
-    "amemv",    // 抖音短视频 CDN 视频流
-    "douyin",   // 抖音主域名
-    "iesdouyin",// 抖音 API 接口与后端服务
-    "byteimg",  // 字节系图片与静态资源 CDN
-    "toutiao",  // 今日头条
-    "ixigua",   // 西瓜视频
-    "snssdk",   // 字节系通用 SDK 平台
-    "bdurl"     // 字节短网址服务
+    "zijie", "hongguo", "novel", "pangolin", "sigmob",
+    "amemv", "douyin", "iesdouyin", "byteimg",
+    "toutiao", "ixigua", "snssdk", "bdurl"
 ];
 
-// 定义需要触发 UDP 伪装的游戏与实时通讯协议特征词
 const UDP_TARGETS = [
-    "udp",      // 通用 UDP 流量标记
-    "quic",     // HTTP/3 QUIC 协议
-    "game",     // 游戏通用流量
-    "minecraft",// 我的世界
-    "dota",     // DOTA2
-    "lol",      // 英雄联盟
-    "valorant", // 无畏契约
-    "genshin"   // 原神
+    "udp", "quic", "game", "minecraft", "dota", 
+    "lol", "valorant", "genshin"
 ];
 
 /**
- * 辅助函数 1：判断当前访问的主机名是否命中红果/字节系特征
- * @param {string} host - 目标域名（如 "v1-dy.byteimg.com"）
- * @return {boolean} - 若命中返回 true，否则返回 false
+ * 判断是否为红果短剧/字节系目标
  */
 function isHongguoTarget(host) {
-    // 防空保护：如果 host 不存在，直接返回 false
     if (!host) return false;
-    
-    // 转为小写字母，确保大小写不敏感匹配
     const h = host.toLowerCase();
-    
-    // 使用 .some 方法检查是否有任意一个关键字被包含在目标域名中
     return HK_DOMAINS.some(v => h.includes(v));
 }
 
 /**
- * 辅助函数 2：判断是否需要执行 UDP 免流伪装
- * @param {string} host - 目标主机名
- * @param {boolean} isUdp - 是否为 UDP 类型会话
- * @return {boolean} - 若需要 UDP 伪装返回 true，否则返回 false
+ * 判断是否需要进行 UDP 伪装
  */
 function isUdpMasqueradeTarget(host, isUdp) {
-    // 如果不是 UDP 流量，直接返回 false 不做 UDP 伪装
     if (!isUdp) return false;
-    
-    // 如果是 UDP 流量但拿不到 host（如直接 IP 访问），默认进行伪装
     if (!host) return true;
-    
-    // 将 host 转为小写
     const h = host.toLowerCase();
-    
-    // 检查是否包含指定的 UDP/游戏特征词，或者默认针对所有 UDP 流量生效
     return UDP_TARGETS.some(v => h.includes(v)) || true;
 }
 
-
 // ==============================================================================
-// 三、 Loon Session 生命周期回调函数 (Loon Protocol Callbacks)
-// 说明：这些函数由 Loon 引擎根据连接事件自动调用
+// 三、 Loon Session 生命周期回调函数 (结合日志输出)
 // ==============================================================================
 
 /**
- * 生命周期回调 1：TCP 连接成功
- * 当与代理服务器的 TCP 握手完成时被 Loon 触发
+ * 生命周期回调 1：TCP 连接建立成功
  */
 function tunnelDidConnected() {
-    // 检查代理服务器是否启用了底层 TLS 加密 (HTTPS/WSS 代理)
-    if (!$session.proxy.isTLS) {
-        // 如果是明文 HTTP 代理，立即构造并写入伪装请求头
-        _writeHttpHeader();
-        
-        // 关键：将状态变量直接挂载在 $session 实例上，实现多并发会话隔离
-        $session.httpStatus = HTTP_STATUS_CONNECTED;
-    }
-    // 若启用了 TLS，则等待 TLS 握手完成后自动进入 tunnelTLSFinished
+    const target = `${$session.conHost}:${$session.conPort}`;
+    console.log(`${LOG_PREFIX} ➔ [TCP 连通] 已连接至代理网关，目标地址: ${target}`);
     
-    // 返回 true 允许 Loon 流程继续
+    if (!$session.proxy.isTLS) {
+        console.log(`${LOG_PREFIX} [明文 HTTP 代理] 开始构建并发送免流请求头...`);
+        _writeHttpHeader();
+        $session.httpStatus = HTTP_STATUS_CONNECTED;
+    } else {
+        console.log(`${LOG_PREFIX} [TLS 代理] 底层 TCP 已就绪，等待 TLS 加密握手...`);
+    }
     return true;
 }
 
 /**
  * 生命周期回调 2：TLS 加密握手成功
- * 仅在配置了 TLS 代理且加密通道建立完毕后触发
  */
 function tunnelTLSFinished() {
-    // 向加密通道内写入伪装 HTTP CONNECT 请求头
+    const target = `${$session.conHost}:${$session.conPort}`;
+    console.log(`${LOG_PREFIX} ➔ [TLS 完成] 安全通道已建立，准备发送加密免流头，目标地址: ${target}`);
+    
     _writeHttpHeader();
-    
-    // 在当前会话上下文记录状态为已连接/已发送请求头
     $session.httpStatus = HTTP_STATUS_CONNECTED;
-    
-    // 返回 true 允许继续
     return true;
 }
 
 /**
- * 生命周期回调 3：从代理服务器读取到数据时触发
- * @param {ArrayBuffer|string} data - 代理服务器下发的数据
- * @return {ArrayBuffer|string|null} - 返回给客户端 App 的数据（返回 null 表示被拦截吞掉）
+ * 生命周期回调 3：收到代理服务器下发的数据
  */
 function tunnelDidRead(data) {
-    // 检查当前会话是否处于“等待代理网关返回握手结果”阶段
+    const target = `${$session.conHost}:${$session.conPort}`;
+    
+    // 状态 A：等待网关回应 200 OK
     if ($session.httpStatus === HTTP_STATUS_WAITRESPONSE) {
-        // 此时已读取到了之前设定的结束符 "\r\n\r\n"，打印调试日志
-        console.log(`[Baidu-Fake] HTTP 握手成功: ${$session.conHost}:${$session.conPort}`);
+        console.log(`${LOG_PREFIX} ✔ [握手成功] 收到网关 200 OK 响应！目标: ${target}`);
+        console.log(`${LOG_PREFIX} [通道建立] 正在调用 $tunnel.established() 并拦截网关响应头...`);
         
-        // 将会话状态更新为“透传转发中”
         $session.httpStatus = HTTP_STATUS_FORWARDING;
-        
-        // 核心 API：通知 Loon 代理通道完全建立，开启底层数据通路
         $tunnel.established($session);
         
-        // 返回 null：把代理网关返回的 "HTTP/1.1 200 Connection Established" 报头拦截并吞掉，不传递给手机 App
+        // 返回 null 表示拦截/吞掉 HTTP 200 响应头，避免干扰 App
         return null;
     }
     
-    // 关键修正：在透传阶段及所有其他未匹配分支中，必须显式使用 return data 传递数据
-    // 避免因为隐式返回 undefined 导致 Loon 把网络数据包丢弃
+    // 状态 B：已进入透传阶段
+    if ($session.httpStatus === HTTP_STATUS_FORWARDING) {
+        // 数据量较大时可取消下方注释，避免日志刷屏
+        // console.log(`${LOG_PREFIX} ⬇ [下行数据] 透传传输中 (${data ? data.byteLength || data.length : 0} bytes)`);
+        return data;
+    }
+    
+    // 兜底返回，防止丢包
     return data;
 }
 
 /**
- * 生命周期回调 4：向代理服务器写入数据成功后触发
- * @return {boolean} - 返回 true 继续写回调；返回 false 挂起后续写回调
+ * 生命周期回调 4：向代理服务器写入数据完成
  */
 function tunnelDidWrite() {
-    // 判断是否在发送完伪装 HTTP 头后的首次写入回调
+    const target = `${$session.conHost}:${$session.conPort}`;
+    
     if ($session.httpStatus === HTTP_STATUS_CONNECTED) {
-        // 更新会话状态为等待代理网关响应
+        console.log(`${LOG_PREFIX} ⬆ [请求头已发送] 等待代理网关回复响应头 (寻找 CRLF 结束符)... Target: ${target}`);
         $session.httpStatus = HTTP_STATUS_WAITRESPONSE;
         
-        // 核心 API：指示 Loon 挂起数据接收，直到收到了代理服务器返回的完整 HTTP 头部（以 \r\n\r\n 结尾）
+        // 告诉 Loon 监听读取直到遇到 \r\n\r\n
         $tunnel.readTo($session, "\r\n\r\n");
-        
-        // 返回 false：暂时挂起写入事件，等待代理网关握手回复
-        return false;
+        return false; // 挂起写回调，等待响应
     }
     
-    // 在后续的透传阶段返回 true，允许常规数据写入
     return true;
 }
 
 /**
- * 生命周期回调 5：会话关闭时触发
- * 当连接断开、超时或主动终止时调用
+ * 生命周期回调 5：连接断开或关闭
  */
 function tunnelDidClose() {
-    // 重置当前会话的状态为无效
-    $session.httpStatus = HTTP_STATUS_INVALID;
+    const target = `${$session.conHost}:${$session.conPort}`;
+    console.log(`${LOG_PREFIX} ✖ [连接断开/关闭] Session 已销毁，目标: ${target}`);
     
-    // 返回 true 允许 Loon 回收 Socket 资源
+    $session.httpStatus = HTTP_STATUS_INVALID;
     return true;
 }
 
-
 // ==============================================================================
-// 四、 核心伪装报头构造与写入 (Header Builder)
+// 四、 核心伪装报头构造与写入 (结合详细报文日志)
 // ==============================================================================
 
 /**
- * 核心辅助函数：根据目标类型生成百度免流伪装头并写入
+ * 构造免流伪装请求头并发送
  */
 function _writeHttpHeader() {
-    // 从当前会话对象中提取实际要访问的目标主机名（如 "v1-dy.byteimg.com"）
     const host = $session.conHost;
-    
-    // 从当前会话对象中提取实际要访问的目标端口（如 443）
     const port = $session.conPort;
-    
-    // 判断当前连接是否为 UDP 协议（Loon 中通过 type === 1 或 isUdp === true 标记）
     const isUdp = $session.type === 1 || $session.isUdp === true;
-    
-    // 计算目标是否符合红果/字节系特征
     const isHg = isHongguoTarget(host);
-    
-    // 计算是否需要进行 UDP 免流伪装
     const doUdpMask = isUdpMasqueradeTarget(host, isUdp);
 
-    // 调试输出连接元数据
-    console.log(`[Baidu-Fake] CONNECT -> ${host}:${port} | isHg: ${isHg} | isUdp: ${isUdp} | UDP-Mask: ${doUdpMask}`);
-
-    // 声明报头字符串变量
+    let modeTitle = "普通 TCP 伪装";
     let header = "";
 
-    // ----------------- 分支 1：UDP / QUIC 流量免流伪装 -----------------
+    // 分支 1：UDP 免流伪装
     if (doUdpMask) {
-        header = `CONNECT ${host}:${port} HTTP/1.1\r\n` +                  // HTTP CONNECT 握手请求行
-                 `Host: ${host}:${port}\r\n` +                             // 修正：Host 必须严格等于实际目标地址与端口
-                 `Proxy-Connection: Keep-Alive\r\n` +                    // 代理长连接
-                 `Connection: keep-alive\r\n` +                          // 客户端长连接
-                 `X-T5-Auth: 683556433\r\n` +                            // 百度网关鉴权 Token
-                 `User-Agent: baiduboxapp/8.0.0.0 (Linux; Android)\r\n` + // 移动版百度 App UA
-                 `X-Bd-Traceid: 0000000000000000000000000000000000000000\r\n` + // 百度内部追踪标记
-                 `X-Bd-Product: BDUSS\r\n` +                             // 百度账号特征
-                 `X-Bd-Uid: 0\r\n` +                                     // 百度用户 UID 标记
-                 `X-Bd-Client-Type: UDP-TRANS\r\n` +                     // 特殊标明：UDP 传输代理模式
-                 `X-Bd-Trans-Type: masquerade\r\n` +                    // 特殊标明：传输层伪装模式
-                 `X-Bd-Request-Mode: tunnel\r\n` +                      // 特殊标明：隧道转发模式
-                 `Accept: */*\r\n` +                                     // 接收所有数据类型
-                 `Content-Length: 0\r\n\r\n`;                            // Content-Length 归零，连续两个 \r\n\r\n 结束 Header
+        modeTitle = "UDP/QUIC 特殊免流伪装";
+        header = `CONNECT ${host}:${port} HTTP/1.1\r\n` +
+                 `Host: 157.0.148.53:443\r\n` +
+                 `Proxy-Connection: Keep-Alive\r\n` +
+                 `Connection: keep-alive\r\n` +
+                 `X-T5-Auth: 683556433\r\n` +
+                 `User-Agent: baiduboxapp/8.0.0.0 (Linux; Android)\r\n` +
+                 `X-Bd-Traceid: 0000000000000000000000000000000000000000\r\n` +
+                 `X-Bd-Product: BDUSS\r\n` +
+                 `X-Bd-Uid: 0\r\n` +
+                 `X-Bd-Client-Type: UDP-TRANS\r\n` +
+                 `X-Bd-Trans-Type: masquerade\r\n` +
+                 `X-Bd-Request-Mode: tunnel\r\n` +
+                 `Accept: */*\r\n` +
+                 `Content-Length: 0\r\n\r\n`;
     } 
-    // ----------------- 分支 2：红果短剧/字节系 TCP 加强版伪装 -----------------
+    // 分支 2：红果短剧/字节系 TCP 加强伪装
     else if (isHg) {
-        header = `CONNECT ${host}:${port} HTTP/1.1\r\n` +                  // 握手请求行
-                 `Host: ${host}:${port}\r\n` +                             // 修正：Host 必须严格匹配实际目标地址与端口
-                 `Proxy-Connection: Keep-Alive\r\n` +                    // 代理长连接
-                 `Connection: keep-alive\r\n` +                          // 客户端长连接
-                 `X-T5-Auth: 683556433\r\n` +                            // 百度鉴权 Token
-                 `User-Agent: baiduboxapp\r\n` +                         // 百度 App 标准 UA
-                 `X-Bd-Traceid: 0000000000000000000000000000000000000000\r\n` + // 注入链路追踪标记
-                 `X-Bd-Product: BDUSS\r\n` +                             // 注入 BDUSS 特征
-                 `X-Bd-Uid: 0\r\n` +                                     // 注入 UID 特征
-                 `Accept: */*\r\n\r\n`;                                  // 报头结束符
+        modeTitle = "字节系/红果短剧 TCP 加强伪装";
+        header = `CONNECT ${host}:${port} HTTP/1.1\r\n` +
+                 `Host: 157.0.148.53:443\r\n` +
+                 `Proxy-Connection: Keep-Alive\r\n` +
+                 `Connection: keep-alive\r\n` +
+                 `X-T5-Auth: 683556433\r\n` +
+                 `User-Agent: baiduboxapp\r\n` +
+                 `X-Bd-Traceid: 0000000000000000000000000000000000000000\r\n` +
+                 `X-Bd-Product: BDUSS\r\n` +
+                 `X-Bd-Uid: 0\r\n` +
+                 `Accept: */*\r\n\r\n`;
     } 
-    // ----------------- 分支 3：普通 TCP 目标基础伪装 -----------------
+    // 分支 3：普通 TCP 伪装
     else {
-        header = `CONNECT ${host}:${port} HTTP/1.1\r\n` +                  // 标准握手请求行
-                 `Host: ${host}:${port}\r\n` +                             // 修正：Host 必须严格匹配实际目标地址与端口
-                 `Proxy-Connection: Keep-Alive\r\n` +                    // 代理长连接
-                 `Connection: keep-alive\r\n` +                          // 客户端长连接
-                 `X-T5-Auth: 683556433\r\n` +                            // 百度鉴权 Token
-                 `User-Agent: baiduboxapp\r\n\r\n`;                      // 基础百度 UA 伪装及结束符
+        modeTitle = "基础 TCP 伪装";
+        header = `CONNECT ${host}:${port} HTTP/1.1\r\n` +
+                 `Host: 157.0.148.53:443\r\n` +
+                 `Proxy-Connection: Keep-Alive\r\n` +
+                 `Connection: keep-alive\r\n` +
+                 `X-T5-Auth: 683556433\r\n` +
+                 `User-Agent: baiduboxapp\r\n\r\n`;
     }
 
-    // 核心 API：调用 Loon 底层 $tunnel.write 将构造好的伪装报头写入 Socket 发送给代理网关
+    // 打印分支匹配结果日志
+    console.log(`${LOG_PREFIX} ⚙ [匹配模式: ${modeTitle}] -> Host: ${host}:${port} | isHg: ${isHg} | isUdp: ${isUdp}`);
+    
+    // 打印最终写入的 Header 结构 (替换换行符方便在日志单行展示)
+    console.log(`${LOG_PREFIX} 📝 [发送报文Preview]:\n${header.replace(/\r\n/g, " \\r\\n ")}`);
+
+    // 写入请求头
     $tunnel.write($session, header);
 }
